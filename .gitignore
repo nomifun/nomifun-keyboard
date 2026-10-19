@@ -1,0 +1,37 @@
+# Generated build state; keep source defaults and protocol fixtures.
+/firmware/build*/
+firmware/managed_components/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/sdkconfig.bak
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+local-*.json
+*.log
+backups/
+flash-original.bin
+original-apps/
+/host/
+
+# Local development and operating-system files.
+.venv/
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.tmp
+*.dmp
+*.exe
+*.pdb
+*.o
+*.obj
+*.bin
+*.hex
+*.uf2
+*.elf
+*.map

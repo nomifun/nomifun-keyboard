@@ -1,0 +1,46 @@
+# Native Four-Key USB Contract
+
+English | [简体中文](usb-protocol.zh.md)
+
+The current product uses only key events, permanent NONE, and the fixed status screen; recording is governed by the [NomiFun OS audio contract](input-audio.md). The single product design is the [complete design](../design/nomifun-native-keyboard.md). The current source firmware is `0.3-screen.2` (the version installed on hardware is recorded in local private device records — see [DEVICE.md](../../DEVICE.md)); it must provide native v1, a nonzero epoch, and `audio_source:system`. There is no legacy-firmware K1 fallback path or onboard-audio compatibility mode.
+
+A candidate USB VID/PID `303A:1001` is not sufficient to confirm the product; you must check `hardware:vibe_keyboard`, a nonempty stable `device_id`, and native v1. The device ID is derived from the ROM MAC as `NK-` plus 12 hex digits; COM, /dev/cu.*, and ttyACM are per-connection addresses only. A single Rust owner opens the serial port raw/binary — no reset, no auto-flash.
+
+Frames: `01 10 length:u16-le UTF8-JSON`, host JSON ≤512 bytes; the parse workspace is 128 tokens, single strings ≤128 UTF-8 bytes, max depth 12; all currently legal commands are flat objects. The native core only has type 0x10. Strictly reject duplicate/extra fields, non-integer IDs, and out-of-bounds data; the bounded incremental parser resynchronizes byte-by-byte through boot ROM noise, and application logs must not leak into the protocol. An unexpected type 0x01 audio frame is reported as an explicit protocol error — it is not decoded, uploaded, or converted into OS audio.
+
+## Handshake and NONE
+
+`transport(kind=usb) → get_device_info → device_info → nk_capabilities`: identity and capabilities are adjacent and share the epoch. `transport` closes the old epoch, drains queues and waits for in-flight TX to finish, increments a nonzero epoch, resets stale gestures, and waits for all keys to be released. Ping every 2 seconds; after the 5-second lease expires a new handshake is required — a physical connection does not mean the host is ready.
+
+```json
+{"event":"device_info","hardware":"vibe_keyboard","firmware_version":"0.3-screen.2","device_id":"NK-<12hex>","buttons":["k1","k2","k3","k4"],"native_keyboard_protocol":1,"epoch":1}
+{"event":"nk_capabilities","protocol":1,"epoch":1,"firmware_build":"nomifun-native-0.3-screen.2","policy_ack":true,"wait_release":true,"audio_source":"system","key_events":["button_down","button_up","button_click"],"display":{"version":1,"available":true,"width":428,"height":142,"privacy":"status_only"}}
+{"event":"nk_policy","epoch":1,"request_id":1,"voice_key":"none"}
+{"event":"nk_policy_applied","epoch":1,"request_id":1,"session_id":0,"voice_key":"none","capture_stopped":true,"waiting_release":true}
+```
+
+The host may only send `voice_key:none`; it must not send any policy that enables onboard capture. The device rejects other keys, `nk_stop`/`nk_cancel`, and any other business command. A NONE receipt must match epoch/request with `session_id:0`, `capture_stopped:true`, and `waiting_release:true`; no USB audio session is established.
+
+The host strictly requires the native v1 core `protocol/epoch/policy_ack/wait_release` plus `audio_source:system`. Factory 0.3.8 or any other non-conforming firmware report is unsupported and never reaches the four-key product runtime. The firmware has no microphone-capture entry point.
+
+`request_id` is nonzero and strictly increasing per epoch; a byte-identical retry of the last request returns the cached reply without resetting gestures again. The same ID with different bytes is `request_conflict`, a smaller ID is `stale_request`, and cross-epoch IDs are rejected. Each new NONE request resets gestures and waits for release; `waiting_release:true` is enforced by the device's internal gate with no extra ready event. Only a receipt matching epoch/request/`voice_key:none`/`capture_stopped:true` marks the policy applied; OS capture stopping is confirmed separately.
+
+## Keys
+
+All four keys emit down/up/click with epoch, button (k1–k4), and duration_ms — no session_id. GPIO0/18/17/16, pull-up, active-low; 5 ms sampling with two stable reads. Every new epoch/NONE request first waits for old keys to be released; stale down/up/click events are never replayed. Host actions consume only click, except K4 which consumes the matched down/up pair and ignores click.
+
+Keys, identity, and receipts enter one bounded FIFO written by the single TX task as complete frames. Input queue 32, TX queue 16; overflow or a 250 ms write timeout closes the epoch and stops admission — success is never faked. Faults use a saturating monotone counter; only the single USB owner can retire an observed fault, and a concurrent new fault cannot be cleared. The owner first closes the epoch, resets gestures, and clears old queues/parse fragments, then confirms the TX task exit and the drained driver buffer via IDF `usb_serial_jtag_wait_tx_done`, and finally drains stale RX within a bounded read count until clearly idle; if still busy, a read fails, the buffer does not drain, or the bound is exhausted, the fault persists. After retirement the epoch stays 0 and only a later complete `transport` is accepted; a new epoch still requires explicit NONE and all keys released — key admission never auto-resumes. On every serial reopen the host first clears its receive buffer and creates a new parser, so stale frame fragments that already arrived do not leak into the new connection. Production console/log/panic text is disabled. Hardware actions carry no model text or executable commands.
+
+Physical k1–k4 map fixed to K1–K4 with no calibration or mapping cache. While the main app is not running, the service only accepts a k1 cold start, with presses within 3 seconds merged; once the app is ready, keys go to the main window logic. IPC allows only typed NONE, Rearm, Display, DesktopStopped, Heartbeat, and management Shutdown — authenticated, single-owner, bounded messages.
+
+`Rearm{generation>0}` is the host IPC recovery barrier and adds no device USB command: it reuses a new-request NONE, waits for the matching actual receipt and for that round's subsequent NONE queue to empty, then sends `Rearmed{generation}` in the same FIFO as keys. Only the newest generation is provable; repeated requests do not reset the device, and old generations are ignored. On connect, recovery, and master-switch/K4/recording-config changes, the main app first revokes the local armed flag; toggling only K2 or K3 does not reset an active K4 gesture. A stale Status(applied) from before these recovery cases cannot re-admit; only this round's Rearmed is accepted. A device reconnect keeps only the host generation, not the old connection's completion proof; the firmware still owns the release gate for stale presses.
+
+A normal GUI exit confirms the OS stream stopped and sends DesktopStopped; the daemon keeps NONE/K1. An external stop/uninstall first confirms OS capture stopped through the separate authenticated `desktop.json` endpoint, then waits for the `desktop.lock` life lock to release; a missing descriptor with a busy lock is an error — it cannot be treated as "GUI absent". The CLI holds the exclusive life lock until the daemon's final completion receipt and login cleanup finish. Final daemon success requires both the NONE confirmation and the GUI's DesktopStopped; a disconnect must not impersonate an OS capture-stop proof.
+
+If the GUI already crashed, its OS audio stream ends with the process, but the daemon remains unproven; once the CLI holds the life lock it may use the typed `request_shutdown_after_desktop_exit(&DesktopQuiescence)` to carry an independent exit proof. The guard holds `desktop.lock` plus the dedicated `desktop-exited.lock`, and keeps a private random `desktop-exited.json` meanwhile; the service checks the random value and that both locks are still held before reaping an orphaned daemon. When the guard ends it deletes the proof first, then releases the maintenance lock and the GUI life lock; if the CLI is killed and a stale file remains, a free maintenance lock is still not accepted. A new GUI holds only the GUI life lock and clears stale proofs first, so even the window before it deletes the file cannot reuse an old proof. An in-app exit still uses the original DesktopStopped path and cannot claim the process exited.
+
+Public synthetic fixture: [native-keyboard-v1.json](fixtures/native-keyboard-v1.json). The current C tests cover the complete four-key events, absence of session, stale-key release, NONE idempotence, rejection of capture-enabling policies, and the epoch/JSON bounds; real devices and source versions are recorded separately — an offline build is never reported as a successful flash.
+
+## Status screen extension (this cycle)
+
+The status screen contract is in [screen-status.md](screen-status.md). Capabilities gain a display block; `nk_display`/`nk_display_applied` share the epoch/request queue with NONE; only fixed state strings are sent, never text. The actual TX queue is reduced to 16 entries; USB initializes first, and an unavailable screen degrades independently. Capability updates neither re-apply NONE nor drop an active K4 up event.
